@@ -52,9 +52,11 @@ createApp({
     const token=ref(localStorage.getItem('contractlab_token')||'');
     const user=ref(localStorage.getItem('contractlab_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
-    const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({});
+    const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({}), policy=ref({ledger:{},batch_only:[],buffer_only:[],events:[],ops:[]});
     const form=ref({subject:'订单入站', payload_fields:'order_id,amount'});
-    const nav=['契约版本','入站校验','双写缓冲','契约对账'];
+    const detail=ref(null);
+    const nav=['契约版本','入站校验','双写缓冲','契约对账','对齐册'];
+    const alignLabel=(s)=>({aligned:'已对齐',batch_only:'有缓冲无行',buffer_only:'有行无缓冲',duplicate:'重复缓冲行',none:'非缓冲'}[s]||s);
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -81,6 +83,18 @@ createApp({
       buffers.value=Array.isArray(u.items)?u.items:[];
       const q=await loadJson('/api/reconcile'); if(q===null) return;
       recon.value=q&&typeof q==='object'?q:{};
+      const p=await loadJson('/api/alignment/policy'); if(p===null) return;
+      policy.value=p&&typeof p==='object'?p:{ledger:{},batch_only:[],buffer_only:[],events:[],ops:[]};
+    }
+    async function backfill(batchId){
+      actionErr.value='';
+      const r=await fetch('/api/alignment/backfill',{method:'POST',headers:auth(),body:JSON.stringify({batch_id:batchId})});
+      const j=await r.json(); actionErr.value=r.ok?('对齐：'+j.action):(j.detail||'失败');
+      await refresh();
+    }
+    async function openDetail(batchId){
+      detail.value=await loadJson('/api/ingress/'+batchId);
+      if(detail.value===null) detail.value=null;
     }
     async function validate(){
       actionErr.value='';
@@ -89,7 +103,7 @@ createApp({
       await refresh();
     }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate};
+    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,policy,detail,form,actionErr,login,logout,validate,backfill,openDetail,alignLabel};
   },
   template:`
   <div v-if="!token" class="login">
@@ -124,22 +138,77 @@ createApp({
       </div>
       <div class="card">
         <h2>最近批次</h2>
-        <table><thead><tr><th>批次</th><th>结果</th><th>说明</th></tr></thead>
+        <table><thead><tr><th>批次</th><th>结果</th><th>对齐</th><th>说明</th><th></th></tr></thead>
         <tbody><tr v-for="b in (batches||[]).slice(0,8)" :key="b.id">
           <td>#{{b.id}} {{b.subject}}</td>
           <td><span class="stamp" :class="{bad:b.result!=='通过'}">{{b.result}}</span></td>
+          <td>{{alignLabel(b.alignment)}}</td>
           <td>{{b.detail}}</td>
+          <td><button class="ghost" @click="openDetail(b.id)">详情</button>
+            <button class="ghost" v-if="b.alignment==='batch_only'||b.alignment==='buffer_only'||b.alignment==='duplicate'" @click="backfill(b.id)">补齐</button></td>
         </tr></tbody></table>
       </div>
     </div>
+    <div class="card" v-if="detail">
+      <h2>批次详情 #{{detail.batch.id}}</h2>
+      <p class="meta">结果 {{detail.batch.result}} · 对齐 {{alignLabel(detail.alignment.state)}} · 缓冲行 {{detail.alignment.buffer_rows}}</p>
+      <table><thead><tr><th>缓冲</th><th>批次</th><th>原因</th></tr></thead>
+      <tbody><tr v-for="r in detail.buffers" :key="r.id"><td>{{r.id}}</td><td>{{r.batch_id}}</td><td>{{r.reason}}</td></tr>
+      <tr v-if="!detail.buffers.length"><td colspan="3">无缓冲行（批次{{detail.alignment.state==='batch_only'?'缺缓冲行':'非缓冲'}}）</td></tr></tbody></table>
+      <button class="ghost" style="margin-top:8px" @click="detail=null">收起</button>
+    </div>
     <div class="card" v-show="tab===2">
       <h2>双写缓冲</h2>
-      <table><thead><tr><th>缓冲</th><th>批次</th><th>主题</th><th>原因</th></tr></thead>
-      <tbody><tr v-for="b in buffers" :key="b.id"><td>{{b.id}}</td><td>{{b.batch_id}}</td><td>{{b.subject}}</td><td>{{b.reason}}</td></tr></tbody></table>
+      <table><thead><tr><th>缓冲</th><th>批次</th><th>主题</th><th>原因</th><th>对齐</th><th></th></tr></thead>
+      <tbody><tr v-for="b in buffers" :key="(b.alignment||'')+'-'+b.batch_id+'-'+(b.id||'')">
+        <td>{{b.id||'—'}}</td><td>{{b.batch_id}}</td><td>{{b.subject}}</td><td>{{b.reason||'—'}}</td>
+        <td><span class="stamp" :class="{bad:b.alignment!=='aligned'}">{{alignLabel(b.alignment)}}</span></td>
+        <td><button class="ghost" v-if="b.alignment!=='aligned'" @click="backfill(b.batch_id)">补齐</button></td>
+      </tr></tbody></table>
     </div>
     <div class="card" v-show="tab===3">
-      <h2>契约对账摘要</h2>
+      <h2>契约对账账册</h2>
       <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 对齐 {{recon.aligned}}</p>
+      <div class="pair">
+        <div><h3 class="meta">有缓冲无行（批次 {{recon.batch_only_count||0}}）</h3>
+          <p v-if="!(recon.batch_only_ids||[]).length" class="meta">无</p>
+          <p v-for="id in recon.batch_only_ids||[]" :key="'bo'+id">批次 #{{id}} <button class="ghost" @click="backfill(id)">补齐</button></p>
+        </div>
+        <div><h3 class="meta">有行无缓冲（缓冲行 {{recon.buffer_only_count||0}}）</h3>
+          <p v-if="!(recon.buffer_only_ids||[]).length" class="meta">无</p>
+          <p v-for="id in recon.buffer_only_ids||[]" :key="'oo'+id">缓冲 #{{id}}</p>
+        </div>
+      </div>
+      <p v-if="recon.duplicate_count" class="meta">重复缓冲行 {{recon.duplicate_count}} 笔，见对齐册</p>
+    </div>
+    <div class="card" v-show="tab===4">
+      <h2>缓冲对齐册</h2>
+      <p>选定路径 {{policy.path}} · {{policy.ledger.path_title}}</p>
+      <p class="meta">锁定：对齐册选定后当天不换；{{policy.paths&&policy.paths[policy.path]?policy.paths[policy.path].body:''}}</p>
+      <div class="pair">
+        <div><h3 class="meta">批次无缓冲行</h3>
+          <table><tbody><tr v-for="r in policy.batch_only||[]" :key="'pb'+r.batch_id">
+            <td>#{{r.batch_id}} {{r.subject}} {{r.result}}</td><td><button class="ghost" @click="backfill(r.batch_id)">补齐</button></td>
+          </tr><tr v-if="!(policy.batch_only||[]).length"><td class="meta">无</td></tr></tbody></table>
+        </div>
+        <div><h3 class="meta">缓冲行无批次</h3>
+          <table><tbody><tr v-for="r in policy.buffer_only||[]" :key="'po'+r.buffer_id">
+            <td>缓冲 #{{r.buffer_id}} → 批次 {{r.batch_id}} {{r.subject||''}}</td><td>{{r.reason}}</td>
+          </tr><tr v-if="!(policy.buffer_only||[]).length"><td class="meta">无</td></tr></tbody></table>
+        </div>
+      </div>
+      <div v-if="(policy.duplicate||[]).length">
+        <h3 class="meta">重复缓冲行</h3>
+        <table><tbody><tr v-for="r in policy.duplicate" :key="'pd'+r.buffer_id">
+          <td>缓冲 #{{r.buffer_id}} → 批次 {{r.batch_id}} {{r.subject}}</td><td>{{r.reason}}</td>
+          <td><button class="ghost" @click="backfill(r.batch_id)">补齐</button></td>
+        </tr></tbody></table>
+      </div>
+      <h3 class="meta">对齐记录（争用 / 失败 / 偏了）</h3>
+      <table><thead><tr><th>类型</th><th>批次</th><th>值班</th><th>说明</th></tr></thead>
+      <tbody><tr v-for="e in (policy.events||[]).slice(0,8)" :key="'pe'+e.id">
+        <td>{{e.kind}}</td><td>{{e.batch_id}}</td><td>{{e.operator}}</td><td>{{e.detail}}</td>
+      </tr></tbody></table>
     </div>
   </div>`
 }).mount('#app');
